@@ -1,0 +1,291 @@
+---
+title: "Haplotype_analysis"
+author: "Awais"
+date: "2024-10-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(rtracklayer)
+library(GenomicRanges)
+library (geneHapR)
+library(tidyverse)
+library(geneHapR)
+library(tidyverse)
+library(readxl)
+library(rlang)
+library(ggstatsplot)
+library(ggplot2)
+library(ggrepel)
+
+rm(list = setdiff(ls(), c("SNP", "gff", "genes")))
+```
+
+```{r}
+gff <- import_gff("all.gff3", format = "GFF")
+SNP = read.delim("SNPs.hmp.txt")
+genes <- gff[gff$type == "gene"]
+```
+
+```{r}
+snp_df= read.csv("Haplotype_analysis.csv", head=TRUE) %>% 
+    mutate(Chr = paste0("Chr", Chr))
+```
+
+```{r}
+snp_ranges <- GRanges(seqnames = snp_df$Chr,
+                      ranges = IRanges(start = snp_df$position - 200000,
+                                     end = snp_df$position + 200000))
+```
+
+```{r}
+overlaps <- findOverlaps(genes, snp_ranges)
+overlapping_genes <- genes[queryHits(overlaps)]
+gene_info <- as.data.frame(overlapping_genes)
+print(gene_info)
+```
+
+```{r}
+
+# Get indices of SNP ranges that overlap with genes
+snp_indices <- subjectHits(overlaps)
+
+# Extract SNP positions using these indices
+overlapping_snp_positions <- snp_df$position[snp_indices]
+
+# Convert overlapping genes to a data frame
+overlapping_genes_df <- as.data.frame(overlapping_genes)
+
+# Add the SNP position as a new column
+overlapping_genes_df$SNP_position <- overlapping_snp_positions
+
+# Reorder columns with SNP_position as the second column
+overlapping_genes_df <- overlapping_genes_df %>%
+  select(seqnames, SNP_position, everything())
+
+```
+
+```{r}
+
+# Calculate the distance in kilobases and include the sign in the same column
+overlapping_genes_df <- overlapping_genes_df %>%
+  mutate(SNP_to_gene_start_kb = round((SNP_position - start) / 1000, 0),
+         SNP_sign = ifelse(SNP_to_gene_start_kb < 0, "<", ">")) %>% 
+  mutate ( SNP_to_gene_start_kb = abs(SNP_to_gene_start_kb )) %>% 
+  mutate(SNP_to_gene_start_kb = paste0(SNP_sign," ",  SNP_to_gene_start_kb, "kb")) %>% 
+  select(-SNP_sign) %>% 
+  select (seqnames, SNP_position, SNP_to_gene_start_kb, everything()) %>% 
+  select(-c( strand, source, score, phase, ID, Parent, score.1))
+
+
+# Unnest list columns in overlapping_genes_df
+overlapping_genes_df_flat <- overlapping_genes_df %>% unnest(cols = everything())
+
+# Save to CSV
+write.csv(overlapping_genes_df_flat, file = "overlapping_genes_df.csv", row.names = FALSE)
+
+```
+
+```{r}
+
+# Load your SNP extraction data
+SNP_extraction <- read.csv("overlapping_genes_df.csv")
+
+# Mutate to remove "Chr" from seqnames and rename column
+SNP_extraction <- SNP_extraction %>% 
+  mutate(seqnames = gsub("Chr", "", seqnames)) %>% 
+  rename("seqnames" = "chrom")  # Rename seqnames to chrom
+
+# Initialize counters and vectors
+no_snp_count <- 0         # Count of files without SNPs
+snp_file_count <- 0       # Count of SNP files saved
+no_snp_genes <- c()       # Vector to store names of genes with no SNPs
+snp_genes <- c()          # Vector to store names of genes with SNPs
+
+# Loop over the SNP_extraction to filter the SNP data
+for (i in seq_len(nrow(SNP_extraction))) {  # Use nrow() for correct indexing
+  chr <- SNP_extraction$chrom[i]
+  start_pos <- SNP_extraction$start[i]
+  end_pos <- SNP_extraction$end[i]
+  
+  # Debugging output to check values
+  print(paste("Filtering for Chromosome:", chr, 
+              "Start:", start_pos, 
+              "End:", end_pos))
+  
+  # Filter the SNP data for each chromosome and position range
+  SNP_filtered <- SNP %>%
+    filter(chrom == chr, pos >= (start_pos - 1500), pos <= (end_pos + 500)) %>% 
+    select(-c (rs., strand, center, assembly, protLSID, panel, QCcode, assayLSID)) 
+    # Ensure you're using the correct filter
+
+  # Check if SNP_filtered has results before saving
+  if (nrow(SNP_filtered) > 0) {
+    # Split the Allele column into ALT and REF
+    SNP_filtered <- SNP_filtered %>%
+      separate(alleles, into = c("REF", "ALT"), sep = "/") %>% 
+      mutate(INFO = NA) %>%
+      select(chrom, pos, REF, ALT, INFO, everything()) %>% 
+      mutate(chrom = paste0("Chr", chrom)) %>% 
+      rename ("chrom"= "CHR" ) 
+   
+   if (any(SNP_filtered[5:ncol(SNP_filtered)] == "NN", na.rm = TRUE)) {
+      # Replace 'NN' with NA from column 5 to the end
+      SNP_filtered <- SNP_filtered %>%
+        mutate(across(5:ncol(SNP_filtered), ~ na_if(as.character(.), "NN")))
+    } else {
+      message("No 'NN' values found. Skipping this file.")
+    }
+    
+
+    # Define the file name based on the chromosome and the Name from SNP_extraction
+    file_name <- paste0(SNP_extraction$Name[i], ".csv")
+    
+    # Save the filtered data as a CSV file
+    write.csv(SNP_filtered, file_name, row.names = FALSE)
+    print(paste("Saved:", file_name))  # Confirmation output
+    snp_file_count <- snp_file_count + 1  # Increment the SNP file counter
+    snp_genes <- c(snp_genes, SNP_extraction$Name[i])  # Add the gene name to the SNP vector
+  } else {
+    print(paste("No SNPs found for Chromosome:", chr, 
+                "Start:", start_pos, 
+                "End:", end_pos))
+    no_snp_count <- no_snp_count + 1  # Increment the counter for files without SNPs
+    no_snp_genes <- c(no_snp_genes, SNP_extraction$Name[i])  # Add the gene name to the no SNP vector
+  }
+}
+
+# Save genes with no SNPs
+if (length(no_snp_genes) > 0) {
+  no_snp_df <- data.frame(gene = no_snp_genes)
+  write.csv(no_snp_df, "genes_with_no_snp.csv", row.names = FALSE)
+  print("Saved genes with no SNPs to 'genes_with_no_snp.csv'")
+} else {
+  print("All genes have SNPs.")
+}
+
+# Create a data frame for SNP genes
+if (length(snp_genes) > 0) {
+  snp_df <- data.frame(Name = snp_genes) %>% 
+  
+  # Join with SNP_extraction to get start and end positions
+   left_join(select(SNP_extraction, Name, start, end, Note), by = "Name")
+  
+  # Write to CSV
+  write.csv(snp_df, "genes_with_snp.csv", row.names = FALSE)
+  print("Saved genes with SNPs to 'genes_with_snp.csv'")
+} else {
+  print("No genes found with SNPs.")
+}
+
+# Output the total number of files with no SNPs found and total SNP files generated
+print(paste("Total files without SNPs found:", no_snp_count))
+print(paste("Total SNP files saved:", snp_file_count))
+
+```
+
+
+################### Haplotype analysis #################
+```{r}
+gene_infom <- read.csv("genes_with_snp.csv")
+pheno <- read.delim("Normalized_photo_181_duplication_extreme.txt") %>%
+  rename("Taxa" ="Accession")
+snp_files <- as.character(paste0(gene_infom$Name, ".csv"))
+snp_data_list <- lapply(snp_files, read.csv)
+```
+
+```{r}
+gene_names <- gene_infom$Name
+annotate_file = gene_infom$Note
+start_positions <- gene_infom$start
+end_positions <- gene_infom$end
+```
+
+```{r}
+for (i in seq_along(snp_files)) {
+  
+  # Read SNP data
+  snp_data <- read.csv(snp_files[i])
+  
+    # Check if the number of rows in the "CHR" column is less than 3
+  if (nrow(snp_data) < 3) {
+    message("Skipping gene ", gene_names[i], " due to insufficient data in CHR column.")
+    next  # Skip to the next iteration if there are less than 3 rows
+  }
+  
+  # Convert to haplotype format
+  hapResult <- table2hap(snp_data, hapPrefix = "H", hetero_remove = TRUE, na_drop = TRUE)
+  
+  # Summarize haplotypes
+  hapSummary <- hap_summary(hapResult)
+  
+  # Check the frequency column to decide filtering criteria
+ freq_values <- hapSummary$freq
+  
+  # Remove NA values from frequency values
+  freq_values <- na.omit(freq_values)  # Optionally, can use na.rm = TRUE in the sum() below
+
+   count_greater_5 <- sum(freq_values >= 5)
+   count_greater_2 <- sum(freq_values >= 2)
+  # Apply conditional filtering based on frequency values
+   if (count_greater_5 >= 3) {
+    hap <- filter_hap(hapSummary, rm.mode = "freq", freq.min = 5)
+  } else if (count_greater_2 >= 3) {
+    hap <- filter_hap(hapSummary, rm.mode = "freq", freq.min = 2)
+  } else {
+    message("Skipping gene ", gene_names[i], " due to insufficient haplotype diversity.")
+    next
+  }
+  
+  
+  # Set up output filename for the plot
+  output_filename <- paste0(gene_names[i], "_Gene_v1.png")
+  
+  # Create a PNG plot for gene model variations
+  png(filename = output_filename, width = 2400, height = 1600, res = 300)
+  displayVarOnGeneModel(hap, gff,
+                        startPOS = (start_positions[i] - 1000),
+                        endPOS = (end_positions[i] + 500),
+                        cex = 0.50,
+                        geneElement = c("CDS", "three_prime_UTR", "five_prime_UTR"))
+  dev.off()
+  
+  # Prepare data for the violin plot
+  hap_selection <- hap %>%
+    select(Hap, Accession) %>%
+    separate_rows(Accession, sep = ";") %>%
+    left_join(pheno, by = "Accession") %>%
+    select(-2)  # Adjust if necessary
+  
+  # Generate violin plot for photosynthesis
+  violin_plot <- ggbetweenstats(
+    data  = hap_selection,
+    x     = Hap,
+    y     = photo_,  # Replace with actual column name
+    message = FALSE,
+    mean.plotting = FALSE,
+    type = "m", 
+    xlab = paste0(gene_names[i], "(", annotate_file[i], ")"),
+    ylab = "Photosynthesis",
+    effsize.type = "unbiased",
+    pairwise.display = "significant",
+    conf.level = 0.99,
+    boxplot.args = list(width = 0)
+  ) +
+    theme(axis.text.x = element_text(size=10, colour = "black"), 
+          axis.text.y = element_text(size=10, colour = "black"),
+          axis.title.x = element_text(size=12, face="bold", colour = "black"),    
+          axis.title.y = element_text(size=12, face="bold", colour = "black"))
+  
+  # Save the violin plot
+  ggsave(paste0( gene_names[i],"_Violin", ".png"), plot = violin_plot, width = 6, height = 5, dpi = 300)
+}
+
+```
+
+
